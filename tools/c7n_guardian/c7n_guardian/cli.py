@@ -27,6 +27,9 @@ from c7n.utils import format_event, chunks
 
 from c7n_org.cli import init, filter_accounts, CONFIG_SCHEMA, WORKER_COUNT
 
+from itertools import repeat
+from functools import reduce
+
 log = logging.getLogger('c7n-guardian')
 
 
