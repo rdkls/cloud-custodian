@@ -27,6 +27,9 @@ from c7n.utils import format_event, chunks
 
 from c7n_org.cli import init, filter_accounts, CONFIG_SCHEMA, WORKER_COUNT
 
+from itertools import repeat
+from functools import reduce
+
 log = logging.getLogger('c7n-guardian')
 
 
@@ -48,46 +51,79 @@ def cli():
 @click.option('-a', '--accounts', multiple=True, default=None)
 @click.option('--master', help='Master account id or name')
 @click.option('--debug', help='Run single-threaded', is_flag=True)
-@click.option('--region', default='us-east-1')
+@click.option(
+    '-r', '--region',
+    default=['all'], help='Region to report on (default: all)',
+    multiple=True)
 def report(config, tags, accounts, master, debug, region):
     """report on guard duty enablement by account"""
     accounts_config, master_info, executor = guardian_init(
         config, debug, master, accounts, tags)
 
-    session = get_session(
-        master_info.get('role'), 'c7n-guardian',
-        master_info.get('profile'),
-        region)
+    regions = expand_regions(region)
 
-    client = session.client('guardduty')
-    detector_id = get_or_create_detector_id(client)
+    accounts_report = [x for x in executor(max_workers=WORKER_COUNT).map(
+        report_one_region,
+        repeat(config),
+        repeat(tags),
+        repeat(accounts),
+        repeat(master),
+        repeat(debug),
+        regions,
+    )]
+    accounts_report = reduce(lambda x, y: x + y, accounts_report)
+    accounts_report.sort(key=operator.itemgetter('updated'), reverse=True)
+    print(tabulate(accounts_report, headers=('keys')))
+
+
+def report_one_region(
+    config,
+    tags,
+    accounts,
+    master,
+    debug,
+    region,
+):
+    """report on guard duty enablement by account"""
+    accounts_config, master_info, executor = guardian_init(
+        config, debug, master, accounts, tags)
+
+    master_session = get_session(
+        master_info['role'],
+        'c7n-guardian',
+        master_info.get('profile'),
+        region,
+    )
+    master_client = master_session.client('guardduty')
+    detector_id = get_or_create_detector_id(master_client)
+    if not detector_id:
+        return []
 
     members = {}
-    for page in client.get_paginator('list_members').paginate(DetectorId=detector_id):
+    for page in master_client.get_paginator('list_members').paginate(DetectorId=detector_id):
         for member in page['Members']:
             members[member['AccountId']] = member
 
     accounts_report = []
     for a in accounts_config['accounts']:
         ar = dict(a)
-        accounts_report.append(ar)
         ar.pop('tags', None)
         ar.pop('role')
         ar.pop('regions', None)
-        if a['account_id'] not in members:
+        ar['region'] = region
+        if a['account_id'] in members:
+            m = members[a['account_id']]
+            ar['status'] = m['RelationshipStatus']
+            ar['member'] = True
+            ar['joined'] = m['InvitedAt']
+            ar['updated'] = m['UpdatedAt']
+        else:
             ar['member'] = False
             ar['status'] = None
             ar['invited'] = None
             ar['updated'] = datetime.datetime.now().isoformat()
-            continue
-        m = members[a['account_id']]
-        ar['status'] = m['RelationshipStatus']
-        ar['member'] = True
-        ar['joined'] = m['InvitedAt']
-        ar['updated'] = m['UpdatedAt']
-
-    accounts_report.sort(key=operator.itemgetter('updated'), reverse=True)
-    print(tabulate(accounts_report, headers=('keys')))
+        accounts_report.append(ar)
+    return accounts_report
 
 
 @cli.command()
@@ -121,6 +157,9 @@ def disable(config, tags, accounts, master, debug,
         master_info.get('profile'), region)
     master_client = master_session.client('guardduty')
     detector_id = get_or_create_detector_id(master_client)
+    if not detector_id:
+        # Couldn't get a detector in this region; perhaps region not opted-in
+        return
 
     if suspend:
         unprocessed = master_client.stop_monitoring_members(
@@ -151,6 +190,9 @@ def disable(config, tags, accounts, master, debug,
 
         member_client = member_session.client('guardduty')
         m_detector_id = get_or_create_detector_id(member_client)
+        if not detector_id:
+            # Couldn't get a detector in this region; perhaps region not opted-in
+            continue
         if disable_detector:
             member_client.update_detector(
                 DetectorId=m_detector_id, Enable=False)
@@ -178,7 +220,7 @@ def get_session(role, session_name, profile, region):
 
 def expand_regions(regions, partition='aws'):
     if 'all' in regions:
-        regions = boto3.Session().get_available_regions('ec2')
+        regions = boto3.Session().get_available_regions('guardduty')
     return regions
 
 
@@ -212,6 +254,10 @@ def enable_region(master_info, accounts_config, executor, message, region):
 
     master_client = master_session.client('guardduty')
     detector_id = get_or_create_detector_id(master_client)
+    if not detector_id:
+        # Couldn't get a detector in this region; perhaps region not opted-in
+        print(f"Couldn't get or create GuardDuty detector with role {master_info.get('role')} in region {region}")
+        return
 
     results = master_client.get_paginator(
         'list_members').paginate(DetectorId=detector_id, OnlyAssociated="FALSE")
@@ -319,6 +365,10 @@ def enable_account(account, master_account_id, region):
         region=region)
     member_client = member_session.client('guardduty')
     m_detector_id = get_or_create_detector_id(member_client)
+    if not m_detector_id:
+        # Couldn't get a detector in this region; perhaps region not opted-in
+        print(f"Couldn't get or create GuardDuty detector with role {account.get('role')} in region {region}")
+        return
     all_invitations = member_client.list_invitations().get('Invitations', [])
     invitations = [
         i for i in all_invitations
@@ -338,7 +388,15 @@ def enable_account(account, master_account_id, region):
 
 
 def get_or_create_detector_id(client):
-    detectors = client.list_detectors().get('DetectorIds')
+    try:
+        detectors = client.list_detectors().get('DetectorIds')
+    except ClientError as e:
+        # Occurs if the region is unavailable / not opted-in
+        # Regions available:        https://docs.aws.amazon.com/general/latest/gr/guardduty.html
+        # Regions requiring opt-in: https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/using-regions-availability-zones.html#concepts-available-regions
+        if e.response['Error']['Code'] == 'UnrecognizedClientException':
+            return None
+
     if detectors:
         return detectors[0]
     else:
