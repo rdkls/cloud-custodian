@@ -62,8 +62,10 @@ def report(config, tags, accounts, master, debug, region):
     client = session.client('guardduty')
     detector_id = get_or_create_detector_id(client)
 
-    members = {m['AccountId']: m for m in
-               client.list_members(DetectorId=detector_id).get('Members')}
+    members = {}
+    for page in client.get_paginator('list_members').paginate(DetectorId=detector_id):
+        for member in page['Members']:
+            members[member['AccountId']] = member
 
     accounts_report = []
     for a in accounts_config['accounts']:
