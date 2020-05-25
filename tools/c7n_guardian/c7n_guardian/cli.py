@@ -176,8 +176,10 @@ def disable(config, tags, accounts, master, debug,
         ).get('UnprocessedAccounts', ())
 
         if unprocessed:
-            log.warning(f"{region}\tFollowing accounts where unprocessed\n{format_event(unprocessed)}")
-        log.info(f"{region}\tStopped monitoring {len(accounts_config['accounts'])} accounts in master")
+            log.warning(f"""{region}\tFollowing accounts where
+                        unprocessed\n{format_event(unprocessed)}""")
+        log.info(f"""{region}\tStopped monitoring
+                 {len(accounts_config['accounts'])} accounts in master""")
         return
 
     if dissociate:
@@ -250,7 +252,10 @@ def expand_regions(regions, partition='aws'):
     '-r', '--region',
     default=['all'], help='Region to enable (default: all)',
     multiple=True)
-@click.option('--enable-email-notification', help='Enable email notification to account roots when iNViting', is_flag=True)
+@click.option(
+    '--enable-email-notification',
+    help='Email account owners when inviting',
+    is_flag=True)
 def enable(config, master, tags, accounts, debug, message, region, enable_email_notification):
     """enable guard duty on a set of accounts"""
     accounts_config, master_info, executor = guardian_init(
@@ -260,7 +265,9 @@ def enable(config, master, tags, accounts, debug, message, region, enable_email_
     with executor(max_workers=WORKER_COUNT) as w:
         futures = []
         for region in regions:
-            futures.append(w.submit(enable_region, master_info, accounts_config, executor, message, region, enable_email_notification))
+            futures.append(w.submit(enable_region, master_info, accounts_config,
+                                    executor, message, region,
+                                    enable_email_notification))
 
         for f in as_completed(futures):
             if f.exception():
@@ -270,7 +277,14 @@ def enable(config, master, tags, accounts, debug, message, region, enable_email_
                 log.info(f"{region}\t{len(f.result())} active member accounts")
 
 
-def enable_region(master_info, accounts_config, executor, message, region, enable_email_notification):
+def enable_region(
+        master_info,
+        accounts_config,
+        executor,
+        message,
+        region,
+        enable_email_notification):
+
     master_session = get_session(
         master_info.get('role'), 'c7n-guardian',
         master_info.get('profile'),
@@ -280,7 +294,8 @@ def enable_region(master_info, accounts_config, executor, message, region, enabl
     detector_id = get_or_create_detector_id(master_client)
     if not detector_id:
         # Couldn't get a detector in this region; perhaps region not opted-in
-        log.info(f"{region}\tCouldn't get or create GuardDuty detector with role {master_info.get('role')} - Perhaps the region isn't enabled?")
+        log.info(f"""{region}\tCouldn't get or create GuardDuty detector with role
+                 {master_info.get('role')} - Perhaps the region isn't enabled?""")
         return
 
     # The list gd_members contains active GuardDuty Member Accounts
@@ -313,7 +328,9 @@ def enable_region(master_info, accounts_config, executor, message, region, enabl
             # We should not re-invite, but should re-accept
             resigned_ids.append(m['AccountId'])
         else:
-            raise Exception(f'GuardDuty member account {m["AccountId"]} had unknown RelationshipStatus "{m["RelationshipStatus"]}" - bailing')
+            raise Exception(f'''GuardDuty member account {m["AccountId"]} had
+                            unknown RelationshipStatus
+                            "{m["RelationshipStatus"]}" - bailing''')
     # Filter by accounts under consideration per config and cli flags
     suspended_ids = {a['account_id'] for a in accounts_config['accounts']
         if a['account_id'] in suspended_ids}
@@ -323,7 +340,8 @@ def enable_region(master_info, accounts_config, executor, message, region, enabl
             DetectorId=detector_id,
             AccountIds=list(suspended_ids)).get('UnprocessedAccounts')
         if unprocessed:
-            log.warning(f"{region}\tUnprocessed accounts on re-start monitoring {format_event(unprocessed)}")
+            log.warning(f"""{region}\tUnprocessed accounts on re-start monitoring
+                        {format_event(unprocessed)}""")
         log.info("{region}\tRestarted monitoring on {len(suspended_ids)} accounts")
 
     accounts_not_members = [{'AccountId': account['account_id'], 'Email': account['email']}
@@ -336,23 +354,28 @@ def enable_region(master_info, accounts_config, executor, message, region, enabl
             return list(active_ids)
 
     if (len(accounts_not_members) + len(gd_member_ids)) > 1000:
-        raise ValueError(f"{region}\tGuard Duty only supports 1000 member accounts per master account")
+        raise ValueError(f"""{region}\tGuard Duty only supports 1000 member
+                         accounts per master account""")
 
     log.info(f"{region}\tEnrolling {len(accounts_not_members)} accounts in guard duty")
 
     unprocessed = []
     for account_set in chunks(accounts_not_members, 25):
-        new_members = master_client.create_members(DetectorId=detector_id, AccountDetails=account_set)
+        new_members = master_client.create_members(DetectorId=detector_id,
+                                                   AccountDetails=account_set)
         unprocessed.extend(new_members.get('UnprocessedAccounts', []))
         # If the account was already a member, ignore
-        unprocessed = list(filter(lambda x: x['Result'] != 'The request is rejected because the given account ID is already a member or associated member of the current account.', unprocessed))
+        unprocessed = list(filter(lambda x: x['Result'].find('already a membe') == -1, unprocessed))
     if unprocessed:
-        log.warning(f"{region}\tAccounts were unprocessed - member create\n {format_event(unprocessed)}")
+        log.warning(f"""{region}\tAccounts were unprocessed - member create
+                    {format_event(unprocessed)}""")
 
     log.info(f"{region}\tInviting {len(accounts_not_members)} member accounts")
     unprocessed = []
     for account_set in chunks(
-            [m for m in accounts_not_members if not m['AccountId'] in invited_ids + resigned_ids], 25):
+        [m for m in accounts_not_members if not m['AccountId'] in invited_ids + resigned_ids],
+        25
+    ):
         params = {
             'AccountIds': [m['AccountId'] for m in account_set],
             'DetectorId': detector_id,
@@ -363,7 +386,8 @@ def enable_region(master_info, accounts_config, executor, message, region, enabl
         unprocessed.extend(master_client.invite_members(
             **params).get('UnprocessedAccounts', []))
     if unprocessed:
-        log.warning(f"{region}\tAccounts were unprocessed invite-members\n {format_event(unprocessed)}")
+        log.warning(f"""{region}\tAccounts were unprocessed invite-members
+                    {format_event(unprocessed)}""")
 
     accounts_not_members = [{'AccountId': account['account_id'], 'Email': account['email']}
                for account in accounts_config['accounts']
@@ -399,7 +423,8 @@ def enable_account(account, master_account_id, region):
     m_detector_id = get_or_create_detector_id(member_client)
     if not m_detector_id:
         # Couldn't get a detector in this region; perhaps region not opted-in
-        log.info(f"{region}\tCouldn't get or create GuardDuty detector with role {account.get('role')} - Perhaps the region isn't enabled?")
+        log.info(f"""{region}\tCouldn't get or create GuardDuty detector with role
+                 {account.get('role')} - Perhaps the region isn't enabled?""")
         return
     all_invitations = member_client.list_invitations().get('Invitations', [])
     invitations = [
@@ -407,7 +432,9 @@ def enable_account(account, master_account_id, region):
         if i['AccountId'] == master_account_id]
     invitations.sort(key=operator.itemgetter('InvitedAt'))
     if not invitations:
-        log.warning(f"{region}\tNo guard duty invitation found Account Name:{account['name']} ID: {account['account_id']} Detector ID:{m_detector_id}")
+        log.warning(f"""{region}\tNo guard duty invitation found Account
+                    Name:{account['name']} ID: {account['account_id']} Detector
+                    ID:{m_detector_id}""")
         return
 
     member_client.accept_invitation(
